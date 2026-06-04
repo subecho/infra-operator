@@ -43,16 +43,19 @@ import (
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	instancehav1 "github.com/openstack-k8s-operators/infra-operator/apis/instanceha/v1beta1"
 	memcachedv1 "github.com/openstack-k8s-operators/infra-operator/apis/memcached/v1beta1"
 	networkv1 "github.com/openstack-k8s-operators/infra-operator/apis/network/v1beta1"
 	rabbitmqv1 "github.com/openstack-k8s-operators/infra-operator/apis/rabbitmq/v1beta1"
 	redisv1 "github.com/openstack-k8s-operators/infra-operator/apis/redis/v1beta1"
 
+	instanceha_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/instanceha"
 	memcached_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/memcached"
 	network_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/network"
 	rabbitmq_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/rabbitmq"
 	redis_ctrl "github.com/openstack-k8s-operators/infra-operator/internal/controller/redis"
 
+	webhookinstancehav1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/instanceha/v1beta1"
 	webhookmemcachedv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/memcached/v1beta1"
 	webhooknetworkv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/network/v1beta1"
 	webhookrabbitmqv1beta1 "github.com/openstack-k8s-operators/infra-operator/internal/webhook/rabbitmq/v1beta1"
@@ -69,15 +72,16 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var (
-	cfg       *rest.Config
-	k8sClient client.Client // You'll be using this client in your tests.
-	dynClient *dynamic.DynamicClient
-	testEnv   *envtest.Environment
-	ctx       context.Context
-	cancel    context.CancelFunc
-	logger    logr.Logger
-	namespace string
-	th        *infra_test.TestHelper
+	cfg           *rest.Config
+	k8sClient     client.Client // You'll be using this client in your tests.
+	dynClient     *dynamic.DynamicClient
+	testEnv       *envtest.Environment
+	ctx           context.Context
+	cancel        context.CancelFunc
+	logger        logr.Logger
+	namespace     string
+	th            *infra_test.TestHelper
+	bgpReconciler *network_ctrl.BGPConfigurationReconciler
 )
 
 func TestAPIs(t *testing.T) {
@@ -155,6 +159,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = rabbitmqv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	err = instancehav1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
 	err = memcachedv1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 	err = redisv1.AddToScheme(scheme.Scheme)
@@ -214,6 +220,8 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = webhooknetworkv1beta1.SetupDNSMasqWebhookWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
+	err = webhookinstancehav1beta1.SetupInstanceHaWebhookWithManager(k8sManager)
+	Expect(err).NotTo(HaveOccurred())
 	err = webhookmemcachedv1beta1.SetupMemcachedWebhookWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 	err = webhookredisv1beta1.SetupRedisWebhookWithManager(k8sManager)
@@ -255,14 +263,22 @@ var _ = BeforeSuite(func() {
 	}).SetupWithManager(context.Background(), k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
-	err = (&network_ctrl.BGPConfigurationReconciler{
+	bgpReconciler = &network_ctrl.BGPConfigurationReconciler{
 		Client:  k8sManager.GetClient(),
 		Scheme:  k8sManager.GetScheme(),
 		Kclient: kclient,
-	}).SetupWithManager(context.Background(), k8sManager)
+	}
+	err = bgpReconciler.SetupWithManager(context.Background(), k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&rabbitmq_ctrl.TransportURLReconciler{
+		Client:  k8sManager.GetClient(),
+		Scheme:  k8sManager.GetScheme(),
+		Kclient: kclient,
+	}).SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	err = (&instanceha_ctrl.Reconciler{
 		Client:  k8sManager.GetClient(),
 		Scheme:  k8sManager.GetScheme(),
 		Kclient: kclient,

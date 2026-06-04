@@ -17,13 +17,18 @@ import (
 	instancehav1 "github.com/openstack-k8s-operators/infra-operator/apis/instanceha/v1beta1"
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	env "github.com/openstack-k8s-operators/lib-common/modules/common/env"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 
+	"fmt"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 )
+
+const instanceHaUID int64 = 42401
 
 // Deployment creates a Kubernetes Deployment for the InstanceHa resource
 func Deployment(
@@ -34,6 +39,9 @@ func Deployment(
 	configHash string,
 	containerImage string,
 	topology *topologyv1.Topology,
+	acSecretName string,
+	heartbeatHMACSecretName string,
+	metricsTLS *instancehav1.InstanceHaMetricsTLS,
 ) *appsv1.Deployment {
 	replicas := int32(1)
 
@@ -41,13 +49,56 @@ func Deployment(
 	envVars["OS_CLOUD"] = env.SetValue(openstackcloud)
 	envVars["CONFIG_HASH"] = env.SetValue(configHash)
 	envVars["INSTANCEHA_DISABLED"] = env.SetValue(string(instance.Spec.Disabled))
+	envVars["POD_NAME"] = env.DownwardAPI("metadata.name")
+	envVars["POD_NAMESPACE"] = env.DownwardAPI("metadata.namespace")
+	envVars["INSTANCEHA_CR_NAME"] = env.SetValue(instance.Name)
+	if instance.Spec.InstanceHaHeartbeatPort > 0 {
+		envVars["HEARTBEAT_PORT"] = env.SetValue(fmt.Sprintf("%d", instance.Spec.InstanceHaHeartbeatPort))
+	}
 
 	// create Volume and VolumeMounts
 	volumes := instancehaPodVolumes(instance)
 	volumeMounts := instancehaPodVolumeMounts()
 
+	if acSecretName != "" {
+		envVars["AC_ENABLED"] = env.SetValue("True")
+		volumes = append(volumes, corev1.Volume{
+			Name: "ac-credentials",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  acSecretName,
+					DefaultMode: ptr.To[int32](0o440),
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "ac-credentials",
+			MountPath: "/secrets/ac-credentials",
+			ReadOnly:  true,
+		})
+	}
+
+	// Heartbeat HMAC key volume and mounts
+	if heartbeatHMACSecretName != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "heartbeat-hmac",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  heartbeatHMACSecretName,
+					DefaultMode: ptr.To[int32](0o440),
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "heartbeat-hmac",
+			MountPath: "/secrets/heartbeat-hmac",
+			ReadOnly:  true,
+		})
+		envVars["HEARTBEAT_HMAC_KEY_PATH"] = env.SetValue("/secrets/heartbeat-hmac/hmac-key")
+		envVars["HEARTBEAT_HMAC_KEY_PREVIOUS_PATH"] = env.SetValue("/secrets/heartbeat-hmac/hmac-key-previous")
+	}
+
 	livenessProbe := &corev1.Probe{
-		// TODO might need tuning
 		TimeoutSeconds:      30,
 		PeriodSeconds:       30,
 		InitialDelaySeconds: 10,
@@ -58,10 +109,48 @@ func Deployment(
 		Port: intstr.IntOrString{Type: intstr.Int, IntVal: 8080},
 	}
 
+	readinessProbe := &corev1.Probe{
+		TimeoutSeconds:      10,
+		PeriodSeconds:       10,
+		InitialDelaySeconds: 5,
+	}
+
+	readinessProbe.HTTPGet = &corev1.HTTPGetAction{
+		Path: "/healthz",
+		Port: intstr.IntOrString{Type: intstr.Int, IntVal: 8080},
+	}
+
 	// add CA cert if defined
 	if instance.Spec.CaBundleSecretName != "" {
 		volumes = append(volumes, instance.Spec.CreateVolume())
 		volumeMounts = append(volumeMounts, instance.Spec.CreateVolumeMounts(nil)...)
+	}
+
+	// add metrics TLS cert if defined
+	if metricsTLS != nil && metricsTLS.Enabled() {
+		certSecretName := DefaultMetricsCertSecret
+		if metricsTLS.SecretName != nil && *metricsTLS.SecretName != "" {
+			certSecretName = *metricsTLS.SecretName
+		}
+		metricsSvc := tls.Service{
+			SecretName: certSecretName,
+			CertMount:  ptr.To(MetricsCertPath),
+			KeyMount:   ptr.To(MetricsKeyPath),
+		}
+		volumes = append(volumes, metricsSvc.CreateVolume("metrics-certs"))
+		volumeMounts = append(volumeMounts, metricsSvc.CreateVolumeMounts("metrics-certs")...)
+
+		envVars["METRICS_TLS_CERT"] = env.SetValue(MetricsCertPath)
+		envVars["METRICS_TLS_KEY"] = env.SetValue(MetricsKeyPath)
+		if metricsTLS.MinTLSVersion != "" {
+			envVars["METRICS_TLS_MIN_VERSION"] = env.SetValue(metricsTLS.MinTLSVersion)
+		}
+		if metricsTLS.CipherSuites != "" {
+			envVars["METRICS_TLS_CIPHERS"] = env.SetValue(metricsTLS.CipherSuites)
+		}
+
+		livenessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+		readinessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
 	}
 
 	dep := &appsv1.Deployment{
@@ -83,16 +172,19 @@ func Deployment(
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:            instance.RbacResourceName(),
+					ServiceAccountName: instance.RbacResourceName(),
+					SecurityContext: &corev1.PodSecurityContext{
+						FSGroup: ptr.To(instanceHaUID),
+					},
 					Volumes:                       volumes,
-					TerminationGracePeriodSeconds: ptr.To[int64](0),
+					TerminationGracePeriodSeconds: ptr.To[int64](30),
 					Containers: []corev1.Container{{
 						Name:    "instanceha",
 						Image:   containerImage,
 						Command: []string{"/usr/bin/python3", "-u", "/var/lib/instanceha/instanceha.py"},
 						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:                ptr.To[int64](42401),
-							RunAsGroup:               ptr.To[int64](42401),
+							RunAsUser:                ptr.To(instanceHaUID),
+							RunAsGroup:               ptr.To(instanceHaUID),
 							RunAsNonRoot:             ptr.To(true),
 							AllowPrivilegeEscalation: ptr.To(false),
 							Capabilities: &corev1.Capabilities{
@@ -101,14 +193,11 @@ func Deployment(
 								},
 							},
 						},
-						Env: env.MergeEnvs([]corev1.EnvVar{}, envVars),
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: instance.Spec.InstanceHaKdumpPort,
-							Protocol:      "UDP",
-							Name:          "instanceha",
-						}},
-						VolumeMounts:  volumeMounts,
-						LivenessProbe: livenessProbe,
+						Env:            env.MergeEnvs([]corev1.EnvVar{}, envVars),
+						Ports:          instancehaPorts(instance),
+						VolumeMounts:   volumeMounts,
+						LivenessProbe:  livenessProbe,
+						ReadinessProbe: readinessProbe,
 					}},
 				},
 			},
@@ -135,22 +224,48 @@ func Deployment(
 	return dep
 }
 
+func instancehaPorts(instance *instancehav1.InstanceHa) []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{
+		{
+			ContainerPort: 8080,
+			Protocol:      "TCP",
+			Name:          "metrics",
+		},
+		{
+			ContainerPort: instance.Spec.InstanceHaKdumpPort,
+			Protocol:      "UDP",
+			Name:          "kdump",
+		},
+	}
+	if instance.Spec.InstanceHaHeartbeatPort > 0 {
+		ports = append(ports, corev1.ContainerPort{
+			ContainerPort: instance.Spec.InstanceHaHeartbeatPort,
+			Protocol:      "UDP",
+			Name:          "heartbeat",
+		})
+	}
+	return ports
+}
+
 func instancehaPodVolumeMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
 		{
 			Name:      "openstack-config",
 			MountPath: "/home/cloud-admin/.config/openstack/clouds.yaml",
 			SubPath:   "clouds.yaml",
+			ReadOnly:  true,
 		},
 		{
 			Name:      "openstack-config-secret",
 			MountPath: "/home/cloud-admin/.config/openstack/secure.yaml",
 			SubPath:   "secure.yaml",
+			ReadOnly:  true,
 		},
 		{
 			Name:      "fencing-secret",
 			MountPath: "/secrets/fencing.yaml",
 			SubPath:   "fencing.yaml",
+			ReadOnly:  true,
 		},
 		{
 			Name:      "instanceha-script",
@@ -186,7 +301,8 @@ func instancehaPodVolumes(
 			Name: "openstack-config-secret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: instance.Spec.OpenStackConfigSecret,
+					SecretName:  instance.Spec.OpenStackConfigSecret,
+					DefaultMode: ptr.To[int32](0o440),
 				},
 			},
 		},
@@ -194,7 +310,8 @@ func instancehaPodVolumes(
 			Name: "fencing-secret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: instance.Spec.FencingSecret,
+					SecretName:  instance.Spec.FencingSecret,
+					DefaultMode: ptr.To[int32](0o440),
 				},
 			},
 		},
